@@ -84,6 +84,8 @@
 
 /* Base */
 * { box-sizing: border-box; }
+/* Monaco sizes its completion list in content-box terms; under the reset above the last row is cut off. */
+.monaco-editor .suggest-widget, .monaco-editor .suggest-widget *, .monaco-editor .suggest-details, .monaco-editor .suggest-details * { box-sizing: content-box; }
 /* The app fills the window and scrolls inside its panes; the page around it never scrolls. */
 html, body, #root { height: 100%; margin: 0; overflow: hidden; }
 body { background: var(--bg); color: var(--text); font: 13px/1.5 var(--ui); -webkit-font-smoothing: antialiased; user-select: none; cursor: default; }
@@ -1161,3 +1163,13 @@ button.question-option.on { border-color: var(--text-2); background: var(--bg-ac
 .graph-trail button.current { color: var(--text); font-weight: 600; }
 .graph-trail button:disabled { opacity: 1; }
 .graph-trail-step { display: inline-flex; align-items: center; gap: 6px; }
+
+/* Editing a file: the bar above the editor (unsaved, conflict) and the unsaved mark in the header. */
+.edit-bar { flex: none; display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 4px 10px; border-bottom: 1px solid var(--line); background: var(--bg-subtle); font-size: 12.5px; }
+.edit-bar-text { flex: 1; min-width: 0; color: var(--text-2); overflow-wrap: anywhere; }
+.edit-bar button { font-size: 12px; }
+.edit-bar.conflict { background: color-mix(in srgb, var(--working) 14%, var(--bg-subtle)); }
+.edit-bar.conflict .edit-bar-text { color: var(--text); }
+.edit-bar.failed { background: var(--error-bg); }
+.edit-bar.failed .edit-bar-text { color: var(--del); }
+.tag.unsaved { color: var(--working); }

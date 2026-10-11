@@ -301,18 +301,113 @@ pub fn search_text(root: &Path, q: &TextQuery, cancelled: &(dyn Fn() -> bool + S
     Ok(TextResults { files, truncated: truncated.into_inner() })
 }
 
-/// The text of a file inside `root`, for the read-only preview.
+const BOM: &str = "\u{feff}";
+
+/// The text of a file inside `root`, for the editor. A leading byte-order mark isn't part of the text the editor
+/// shows (it keeps it aside); `write_file` puts it back.
 pub fn read_file(root: &Path, path: &Path) -> Result<String, String> {
     let full = inside(root, path)?;
     let size = std::fs::metadata(&full).map_err(|e| e.to_string())?.len();
     if size > MAX_PREVIEW_BYTES {
-        return Err(format!("This file is too large to preview ({} MB).", size / (1024 * 1024)));
+        return Err(format!("This file is too large to open ({} MB).", size / (1024 * 1024)));
     }
     let bytes = std::fs::read(&full).map_err(|e| e.to_string())?;
     if bytes.contains(&0) {
-        return Err("This file is binary and can't be previewed.".into());
+        return Err("This file is binary and can't be opened.".into());
     }
-    String::from_utf8(bytes).map_err(|_| "This file isn't UTF-8 text and can't be previewed.".into())
+    let text = String::from_utf8(bytes).map_err(|_| "This file isn't UTF-8 text and can't be opened.".to_string())?;
+    Ok(text.strip_prefix(BOM).map(String::from).unwrap_or(text))
+}
+
+/// What saving a file came to.
+#[derive(Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Written {
+    /// Written (or already that text). `previous` is what was on disk before, None for a new file; Rust-only.
+    Saved {
+        #[serde(skip)]
+        previous: Option<String>,
+        /// Whether anything was written.
+        changed: bool,
+    },
+    /// The file isn't what the editor was based on: `current` is what's there now (None: it's gone). Nothing written.
+    Conflict { current: Option<String> },
+}
+
+/// Resolves a file that may not exist yet: itself if it does, otherwise its folder (which must) plus its name.
+fn inside_or_new(root: &Path, path: &Path) -> Result<PathBuf, String> {
+    if path.exists() {
+        return inside(root, path);
+    }
+    let name = path.file_name().ok_or("That isn't a file path.")?;
+    let parent = inside(root, path.parent().ok_or("That isn't a file path.")?)?;
+    Ok(parent.join(name))
+}
+
+/// A new temporary file beside `target`, named for this process and a counter, never one that already exists.
+fn create_temp(target: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut last = None;
+    for _ in 0..16 {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = target.with_file_name(format!(".{name}.lantern-save-{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no temporary name was free")))
+}
+
+/// Saves `text` as the file at `path` inside `root`, if the file is still what the editor opened it as: `expected` is
+/// that text (None: the file shouldn't exist). Anything else on disk is a Conflict and nothing is written, so a save
+/// never overwrites what changed meanwhile (Claude's edit, git). Writes go to a temporary file beside it, then replace
+/// it, so a crash can't leave half a file, and keep its permissions and a byte-order mark it had.
+pub fn write_file(root: &Path, path: &Path, text: &str, expected: Option<&str>) -> Result<Written, String> {
+    let full = inside_or_new(root, path)?;
+    // Only a regular file: reading a pipe or device here would hang, and there's nothing to edit in one.
+    if std::fs::metadata(&full).is_ok_and(|m| !m.is_file()) {
+        return Err("That isn't a regular file.".into());
+    }
+    let disk = match std::fs::read(&full) {
+        Ok(bytes) => Some(String::from_utf8(bytes).map_err(|_| "This file isn't UTF-8 text, so it can't be saved from here.".to_string())?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let plain = |t: &Option<String>| t.as_deref().map(|t| t.strip_prefix(BOM).unwrap_or(t).to_string());
+    let on_disk = plain(&disk);
+    if on_disk.as_deref() != expected.map(|t| t.strip_prefix(BOM).unwrap_or(t)) {
+        return Ok(Written::Conflict { current: on_disk });
+    }
+    if on_disk.as_deref() == Some(text) {
+        return Ok(Written::Saved { previous: disk, changed: false });
+    }
+    let bom = disk.as_deref().is_some_and(|t| t.starts_with(BOM));
+    let mut out = String::with_capacity(text.len() + 3);
+    if bom {
+        out.push_str(BOM);
+    }
+    out.push_str(text);
+    // The temporary file is made new (O_EXCL: it fails if anything is there, a symlink planted at that name included, so
+    // the write can't be led outside the folder), under a name no other save shares.
+    let (tmp, mut file) = create_temp(&full).map_err(|e| format!("Couldn't save: {e}"))?;
+    let mut write = || -> std::io::Result<()> {
+        use std::io::Write;
+        file.write_all(out.as_bytes())?;
+        file.flush()?;
+        if let Ok(meta) = std::fs::metadata(&full) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &full)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Couldn't save: {e}")
+    })?;
+    // `previous` is the file as it was, byte-order mark and all, which is what the change tracker compares with.
+    Ok(Written::Saved { previous: disk, changed: true })
 }
 
 #[cfg(test)]
@@ -474,4 +569,117 @@ mod tests {
             println!("{q:>10}: {:?}, top: {:?}", t.elapsed(), found.iter().take(3).map(|f| f.rel.as_str()).collect::<Vec<_>>());
         }
     }
+
+    #[test]
+    fn saves_a_file_that_is_still_what_the_editor_opened_and_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("run.sh");
+        fs::write(&f, "echo one\n").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
+        let r = write_file(dir.path(), &f, "echo two\n", Some("echo one\n")).unwrap();
+        assert_eq!(r, Written::Saved { previous: Some("echo one\n".into()), changed: true });
+        assert_eq!(fs::read_to_string(&f).unwrap(), "echo two\n");
+        assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o755);
+        // No temporary file is left beside it.
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn writes_nothing_when_the_text_is_unchanged_and_keeps_line_endings_and_a_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "\u{feff}one\r\ntwo\r\n").unwrap();
+        // The editor is given the text without the mark.
+        assert_eq!(read_file(dir.path(), &f).unwrap(), "one\r\ntwo\r\n");
+        let same = write_file(dir.path(), &f, "one\r\ntwo\r\n", Some("one\r\ntwo\r\n")).unwrap();
+        assert_eq!(same, Written::Saved { previous: Some("\u{feff}one\r\ntwo\r\n".into()), changed: false });
+        // `previous` is the file as it was, mark included (what the change tracker compares with).
+        let r = write_file(dir.path(), &f, "one\r\nthree\r\n", Some("one\r\ntwo\r\n")).unwrap();
+        assert_eq!(r, Written::Saved { previous: Some("\u{feff}one\r\ntwo\r\n".into()), changed: true });
+        assert_eq!(fs::read(&f).unwrap(), "\u{feff}one\r\nthree\r\n".as_bytes());
+    }
+
+    #[test]
+    fn a_save_never_overwrites_what_changed_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "claude's version\n").unwrap();
+        let r = write_file(dir.path(), &f, "mine\n", Some("what I opened\n")).unwrap();
+        assert_eq!(r, Written::Conflict { current: Some("claude's version\n".into()) });
+        assert_eq!(fs::read_to_string(&f).unwrap(), "claude's version\n");
+        // Deleted meanwhile: a conflict too, with nothing there.
+        fs::remove_file(&f).unwrap();
+        assert_eq!(write_file(dir.path(), &f, "mine\n", Some("what I opened\n")).unwrap(), Written::Conflict { current: None });
+        assert!(!f.exists());
+        // Told it's gone (expected None), it makes the file again.
+        assert_eq!(write_file(dir.path(), &f, "mine\n", None).unwrap(), Written::Saved { previous: None, changed: true });
+        assert_eq!(fs::read_to_string(&f).unwrap(), "mine\n");
+    }
+
+    #[test]
+    fn will_not_write_outside_the_folder_not_even_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        fs::write(&secret, "keep\n").unwrap();
+        let root = dir.path().join("proj");
+        fs::create_dir(&root).unwrap();
+        assert!(write_file(&root, &secret, "x", Some("keep\n")).is_err());
+        std::os::unix::fs::symlink(&secret, root.join("link.txt")).unwrap();
+        assert!(write_file(&root, &root.join("link.txt"), "x", Some("keep\n")).is_err());
+        // A new file whose folder is outside, or through ".." — refused too.
+        assert!(write_file(&root, &outside.path().join("new.txt"), "x", None).is_err());
+        assert!(write_file(&root, &root.join("../escape.txt"), "x", None).is_err());
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "keep\n");
+    }
+
+    #[test]
+    fn saving_through_a_symlink_inside_the_folder_updates_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.txt");
+        fs::write(&real, "a\n").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("link.txt")).unwrap();
+        write_file(dir.path(), &dir.path().join("link.txt"), "b\n", Some("a\n")).unwrap();
+        assert_eq!(fs::read_to_string(&real).unwrap(), "b\n");
+        assert!(fs::symlink_metadata(dir.path().join("link.txt")).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn a_symlink_planted_where_the_temporary_file_would_go_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("victim.txt");
+        fs::write(&target, "untouched\n").unwrap();
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "one\n").unwrap();
+        // Every name a save could try (the counter is shared with other tests), pointing out of the folder.
+        for n in 0..512 {
+            let name = format!(".a.txt.lantern-save-{}-{n}", std::process::id());
+            std::os::unix::fs::symlink(&target, dir.path().join(name)).unwrap();
+        }
+        // It gives up rather than write through one of them.
+        assert!(write_file(dir.path(), &f, "two\n", Some("one\n")).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "untouched\n");
+        assert_eq!(fs::read_to_string(&f).unwrap(), "one\n");
+    }
+
+    #[test]
+    fn refuses_something_that_is_not_a_regular_file_and_two_saves_at_once_dont_clash() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(write_file(dir.path(), dir.path(), "x", Some("")).is_err());
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "start\n").unwrap();
+        let (root, f2) = (dir.path().to_path_buf(), f.clone());
+        let a = std::thread::spawn(move || write_file(&root, &f2, "from a\n", Some("start\n")));
+        let b = write_file(dir.path(), &f, "from b\n", Some("start\n"));
+        let a = a.join().unwrap();
+        // One of them wins and the other sees a conflict or also saves; neither fails on a shared temporary file.
+        for r in [a, b] {
+            assert!(matches!(r, Ok(Written::Saved { .. }) | Ok(Written::Conflict { .. })), "{r:?}");
+        }
+        assert!(["from a\n", "from b\n"].contains(&fs::read_to_string(&f).unwrap().as_str()));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "no temporary file left behind");
+    }
 }
+
