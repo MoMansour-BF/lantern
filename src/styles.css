@@ -160,7 +160,7 @@ textarea, input, .msg, .step-output, .permission-detail, .finding-text, .review-
 /* Split: two cards --edge from the window edges and --gutter apart; the gap between them is the resize handle. */
 .split { flex: 1; display: flex; min-height: 0; padding: 0 0 0 var(--edge); }
 .split.dragging { cursor: col-resize; user-select: none; }
-.split-left { flex: 0 1 50%; min-width: 320px; display: flex; padding-bottom: var(--edge); }
+.split-left { flex: 0 1 50%; min-width: 384px; display: flex; padding-bottom: var(--edge); }
 .split-left.fill { flex: 1 1 0; padding-right: var(--edge); }
 .split-side { flex: 1 1 0; min-width: calc(360px + var(--gutter)); display: flex; }
 /* While collapsing/expanding the wrapper animates its width and clips; the pane inside keeps a fixed width. */
@@ -672,8 +672,12 @@ button.background-task-stop:hover:not(:disabled) { background: var(--bg-hover); 
 
 /* Step-by-step mode: pages side by side, one on screen, sliding between them. */
 .steps { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.steps-head { display: flex; align-items: center; gap: 10px; height: 44px; flex: none; padding: 0 14px 0 20px; border-bottom: 1px solid var(--line); }
-.steps-rail { display: flex; align-items: center; gap: 4px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+/* The flavour badge and the auto-approve switch always keep their full width. When the row is tight the page dots give
+   way, down to three (46px: the current page's pill and two dots, which the rail keeps scrolled to); the pane itself
+   can't be narrower than that (MIN_LEFT in SplitPane.tsx). The background count is dropped first. */
+.steps-head { container-type: inline-size; display: flex; align-items: center; gap: 10px; height: 44px; flex: none; padding: 0 14px 0 20px; border-bottom: 1px solid var(--line); }
+@container (max-width: 480px) { .steps-head .steps-background { display: none; } }
+.steps-rail { display: flex; align-items: center; gap: 4px; flex: 0 1000 auto; min-width: 46px; overflow-x: auto; scrollbar-width: none; scroll-behavior: smooth; }
 .steps-rail::-webkit-scrollbar { display: none; }
 /* A dot per page; the one on screen stretches into a pill. Build pages are solid, plan pages hollow. */
 .steps-dot { flex: none; width: 8px; height: 8px; padding: 0; border: 1.5px solid var(--faint); border-radius: 999px; background: none; transition: width 0.2s cubic-bezier(0.32, 0.72, 0, 1), background 0.2s; }
@@ -681,11 +685,11 @@ button.background-task-stop:hover:not(:disabled) { background: var(--bg-hover); 
 .steps-dot:hover:not(.current) { border-color: var(--text-2); }
 .steps-dot.current { width: 22px; border-color: var(--text); background: var(--text); }
 /* Still running in the background, beside the phase (the title bar's count, where you're looking). */
-.steps-background { flex: none; display: inline-flex; align-items: center; gap: 6px; height: 20px; padding: 0 8px; border-radius: 999px; background: color-mix(in srgb, var(--working) 12%, transparent); color: var(--working); font-size: 11px; }
+.steps-background { flex: none; white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; height: 20px; padding: 0 8px; border-radius: 999px; background: color-mix(in srgb, var(--working) 12%, transparent); color: var(--working); font-size: 11px; }
 .steps-background .spinner { width: 9px; height: 9px; border-color: color-mix(in srgb, var(--working) 30%, transparent); border-top-color: var(--working); }
 .steps-viewport { position: relative; flex: 1; min-height: 0; overflow: hidden; }
 .steps-track { display: flex; height: 100%; will-change: transform; transition: transform 0.3s cubic-bezier(0.22, 0.61, 0.36, 1); }
-@media (prefers-reduced-motion: reduce) { .steps-track, .steps-dot { transition: none; } }
+@media (prefers-reduced-motion: reduce) { .steps-track, .steps-dot { transition: none; } .steps-rail { scroll-behavior: auto; } }
 .step-page { flex: 0 0 100%; min-width: 0; height: 100%; overflow-y: auto; }
 .step-page-body { max-width: calc(var(--col) + 40px); margin: 0 auto; padding: 22px 24px 28px; display: flex; flex-direction: column; gap: 12px; }
 .step-eyebrow { font-size: 11.5px; font-weight: 500; letter-spacing: 0.02em; color: var(--muted); }
